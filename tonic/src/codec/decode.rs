@@ -168,6 +168,18 @@ impl<T> Streaming<T> {
     }
 }
 
+/// Ensures `buf` has room for `additional` more bytes, growing to exactly
+/// `buf.len() + additional`. `BytesMut::reserve` may grow to twice the current
+/// capacity, and the decoded message can keep this allocation alive.
+fn reserve_exact(buf: &mut BytesMut, additional: usize) {
+    if buf.capacity() - buf.len() >= additional {
+        return;
+    }
+    let mut exact = BytesMut::with_capacity(buf.len() + additional);
+    exact.extend_from_slice(buf);
+    *buf = exact;
+}
+
 impl StreamingInner {
     fn decode_chunk(
         &mut self,
@@ -220,7 +232,12 @@ impl StreamingInner {
                 )));
             }
 
-            self.buf.reserve(len);
+            // Part or all of the body may already be buffered (a single DATA frame often
+            // carries the whole message), so only make room for the bytes still missing.
+            let buffered = self.buf.remaining();
+            if len > buffered {
+                reserve_exact(&mut self.buf, len - buffered);
+            }
 
             self.state = State::ReadBody {
                 compression: compression_encoding,
@@ -453,3 +470,95 @@ impl<T> fmt::Debug for Streaming<T> {
 
 #[cfg(test)]
 static_assertions::assert_impl_all!(Streaming<()>: Send, Sync);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::DecodeBuf;
+    use bytes::Bytes;
+    use http_body::Frame;
+
+    /// Returns the rest of the message as a zero-copy slice, like prost does for `bytes` fields.
+    #[derive(Debug, Default)]
+    struct BytesDecoder;
+
+    impl Decoder for BytesDecoder {
+        type Item = Bytes;
+        type Error = Status;
+
+        fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+            Ok(Some(buf.copy_to_bytes(buf.remaining())))
+        }
+    }
+
+    fn grpc_frame(msg_len: usize) -> Bytes {
+        let mut buf = BytesMut::with_capacity(HEADER_SIZE + msg_len);
+        buf.put_u8(0);
+        buf.put_u32(msg_len as u32);
+        buf.put_bytes(7, msg_len);
+        buf.freeze()
+    }
+
+    /// Sends `wire` as DATA frames of the given sizes.
+    fn streaming(wire: Bytes, frame_sizes: &[usize]) -> Streaming<Bytes> {
+        let mut frames = Vec::new();
+        let mut rest = wire;
+        for &size in frame_sizes {
+            frames.push(Ok::<_, Status>(Frame::data(rest.split_to(size))));
+        }
+        assert!(rest.is_empty());
+        let body = http_body_util::StreamBody::new(tokio_stream::iter(frames));
+        Streaming::new_request(BytesDecoder, body, None, Some(8 * 1024 * 1024))
+    }
+
+    const MSG_LEN: usize = 2 * 1024 * 1024;
+
+    async fn assert_decodes_without_spare_capacity(frame_sizes: &[usize]) {
+        let mut stream = streaming(grpc_frame(MSG_LEN), frame_sizes);
+        let msg = stream.message().await.unwrap().unwrap();
+        assert_eq!(msg.len(), MSG_LEN);
+        // The decoded message shares the decode buffer's allocation. Whatever capacity is
+        // left after it was split off is memory the message keeps alive for nothing.
+        assert_eq!(stream.inner.buf.capacity(), 0, "frames: {frame_sizes:?}");
+        assert!(stream.message().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn whole_message_in_one_frame_is_not_over_reserved() {
+        assert_decodes_without_spare_capacity(&[HEADER_SIZE + MSG_LEN]).await;
+    }
+
+    #[tokio::test]
+    async fn header_then_body_is_sized_exactly() {
+        assert_decodes_without_spare_capacity(&[4096, HEADER_SIZE + MSG_LEN - 4096]).await;
+    }
+
+    #[tokio::test]
+    async fn small_frames_are_sized_exactly() {
+        let total = HEADER_SIZE + MSG_LEN;
+        let mut sizes = vec![16 * 1024; total / (16 * 1024)];
+        sizes.push(total % (16 * 1024));
+        assert_decodes_without_spare_capacity(&sizes).await;
+    }
+
+    #[tokio::test]
+    async fn large_partial_first_frame_is_sized_exactly() {
+        let first = 1536 * 1024;
+        assert_decodes_without_spare_capacity(&[first, HEADER_SIZE + MSG_LEN - first]).await;
+    }
+
+    #[tokio::test]
+    async fn several_messages_in_one_frame() {
+        let mut wire = BytesMut::new();
+        for len in [10, 20, 30] {
+            wire.extend_from_slice(&grpc_frame(len));
+        }
+        let wire = wire.freeze();
+        let total = wire.len();
+        let mut stream = streaming(wire, &[total]);
+        for len in [10, 20, 30] {
+            assert_eq!(stream.message().await.unwrap().unwrap().len(), len);
+        }
+        assert!(stream.message().await.unwrap().is_none());
+    }
+}
