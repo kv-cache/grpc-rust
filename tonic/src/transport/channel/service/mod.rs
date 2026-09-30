@@ -29,7 +29,7 @@ mod user_agent;
 use self::user_agent::UserAgent;
 
 mod reconnect;
-use self::reconnect::Reconnect;
+use self::reconnect::{Mode as ReconnectMode, Reconnect};
 
 mod connection;
 pub(super) use self::connection::Connection;

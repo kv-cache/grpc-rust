@@ -22,7 +22,7 @@
  *
  */
 
-use super::{AddOrigin, Reconnect, SharedExec, UserAgent};
+use super::{AddOrigin, Reconnect, ReconnectMode, SharedExec, UserAgent};
 use crate::{
     body::Body,
     transport::{Endpoint, channel::BoxFuture, service::GrpcTimeout},
@@ -49,7 +49,7 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    fn new<C>(connector: C, endpoint: Endpoint, is_lazy: bool) -> Self
+    fn new<C>(connector: C, endpoint: Endpoint, mode: ReconnectMode, is_lazy: bool) -> Self
     where
         C: Service<Uri> + Send + 'static,
         C::Error: Into<crate::BoxError> + Send,
@@ -102,7 +102,13 @@ impl Connection {
         let make_service =
             MakeSendRequestService::new(connector, endpoint.executor.clone(), settings);
 
-        let conn = Reconnect::new(make_service, endpoint.uri().clone(), is_lazy);
+        let conn = Reconnect::new(
+            make_service,
+            endpoint.uri().clone(),
+            endpoint.executor.clone(),
+            mode,
+            is_lazy,
+        );
 
         Self {
             inner: BoxService::new(stack.layer(conn)),
@@ -119,9 +125,13 @@ impl Connection {
         C::Future: Unpin + Send,
         C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
     {
-        Self::new(connector, endpoint, false).ready_oneshot().await
+        Self::new(connector, endpoint, ReconnectMode::Join, false)
+            .ready_oneshot()
+            .await
     }
 
+    /// Creates a connection that connects on the first request. Requests join the
+    /// connect attempt that runs when they are sent.
     pub(crate) fn lazy<C>(connector: C, endpoint: Endpoint) -> Self
     where
         C: Service<Uri> + Send + 'static,
@@ -129,7 +139,20 @@ impl Connection {
         C::Future: Send,
         C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
     {
-        Self::new(connector, endpoint, true)
+        Self::new(connector, endpoint, ReconnectMode::Join, true)
+    }
+
+    /// Creates a connection for a load-balanced endpoint. `poll_ready` waits until the
+    /// connection is ready, so that the balancer sends requests only to connected
+    /// endpoints.
+    pub(crate) fn lazy_balanced<C>(connector: C, endpoint: Endpoint) -> Self
+    where
+        C: Service<Uri> + Send + 'static,
+        C::Error: Into<crate::BoxError> + Send,
+        C::Future: Send,
+        C::Response: rt::Read + rt::Write + Unpin + Send + 'static,
+    {
+        Self::new(connector, endpoint, ReconnectMode::WaitReady, true)
     }
 }
 
@@ -161,6 +184,8 @@ impl fmt::Debug for Connection {
     }
 }
 
+/// Sends requests on one HTTP/2 connection. Clones share the connection.
+#[derive(Clone)]
 struct SendRequest {
     inner: hyper::client::conn::http2::SendRequest<Body>,
 }
